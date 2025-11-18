@@ -1,2 +1,1 @@
-ccxt
-python-telegram-bot
+# No external runtime dependencies; relies on vendored quants-lab stack.
