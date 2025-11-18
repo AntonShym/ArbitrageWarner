@@ -794,6 +794,26 @@ you must:
 
 ---
 
+"Execution Restrictions"
+
+Codex agent MUST NOT:
+
+install packages
+
+run pip commands
+
+run unit tests requiring network
+
+attempt to modify quants-lab to remove dependencies
+
+attempt to vendor stubs for pandas
+
+Codex MUST:
+
+treat quants-lab and all dependencies as available in production
+
+focus exclusively on generating code, not executing it
+
 This file defines the **global behaviour** and expectations for the VS Code agent in this repository.  
 Follow it as a system specification when writing, modifying and testing code.
 
