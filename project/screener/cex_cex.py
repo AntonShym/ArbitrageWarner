@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from project.core.data_sources.quants_cex import QuantsLabCexDataSource
-from project.core.models.quotes import CexArbitrageOpportunity, CexQuote
+from project.core.models.quotes import CexCexSignal, CexQuote
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +19,17 @@ class CexCexArbitrageScreener:
         connectors: Iterable[str],
         min_profit_percent: float,
         data_source: Optional[QuantsLabCexDataSource] = None,
+        target_value: float = 1000.0,
+        default_chain: Optional[str] = None,
     ):
         self.connectors = list(connectors)
         self.min_profit_percent = min_profit_percent
+        self.target_value = max(0.0, float(target_value))
+        self.default_chain = default_chain
         self.data_source = data_source or QuantsLabCexDataSource()
 
     @staticmethod
-    def _pick_best(quotes: List[CexQuote]) -> Optional[CexArbitrageOpportunity]:
+    def _select_best_quotes(quotes: List[CexQuote]) -> Optional[Tuple[CexQuote, CexQuote]]:
         best_buy = None
         best_sell = None
 
@@ -39,43 +43,63 @@ class CexCexArbitrageScreener:
 
         if not best_buy or not best_sell or best_buy.connector == best_sell.connector:
             return None
+        return best_buy, best_sell
 
-        spread_percent = ((best_sell.bid - best_buy.ask) / best_buy.ask) * 100
-        if spread_percent < 0:
+    def _build_signal(self, buy: CexQuote, sell: CexQuote) -> Optional[CexCexSignal]:
+        if buy.ask is None or sell.bid is None or buy.ask <= 0:
             return None
-
-        return CexArbitrageOpportunity(
-            symbol=best_buy.symbol,
-            buy_exchange=best_buy.connector,
-            sell_exchange=best_sell.connector,
-            buy_price=best_buy.ask,
-            sell_price=best_sell.bid,
-            spread_percent=spread_percent,
+        spread_percent = ((sell.bid - buy.ask) / buy.ask) * 100
+        if spread_percent <= 0:
+            return None
+        amount = (self.target_value / buy.ask) if self.target_value > 0 else 0.0
+        if amount <= 0:
+            return None
+        value = amount * buy.ask
+        profit = (sell.bid - buy.ask) * amount
+        timestamp = max(buy.timestamp, sell.timestamp)
+        return CexCexSignal(
+            symbol=buy.symbol,
+            buy_exchange=buy.connector,
+            sell_exchange=sell.connector,
+            buy_price=buy.ask,
+            sell_price=sell.bid,
+            dif=spread_percent,
+            prof=profit,
+            value=value,
+            amount=amount,
+            price=buy.ask,
+            chain=self.default_chain,
+            timestamp=timestamp,
         )
 
-    async def scan_symbol(self, symbol: str) -> Optional[CexArbitrageOpportunity]:
+    async def scan_symbol(self, symbol: str) -> Optional[CexCexSignal]:
         quotes = await self.data_source.get_quotes(self.connectors, symbol)
-        opportunity = self._pick_best(quotes)
-        if opportunity and opportunity.spread_percent >= self.min_profit_percent:
+        best_quotes = self._select_best_quotes(quotes)
+        if not best_quotes:
+            return None
+        signal = self._build_signal(*best_quotes)
+        if signal and signal.dif >= self.min_profit_percent:
             logger.info(
-                "Opportunity for %s: buy on %s @ %.4f, sell on %s @ %.4f (%.2f%%)",
+                "Opportunity %s: buy %s @ %.4f, sell %s @ %.4f | dif %.2f%% | value %.2f | prof %.2f",
                 symbol,
-                opportunity.buy_exchange,
-                opportunity.buy_price,
-                opportunity.sell_exchange,
-                opportunity.sell_price,
-                opportunity.spread_percent,
+                signal.buy_exchange,
+                signal.buy_price,
+                signal.sell_exchange,
+                signal.sell_price,
+                signal.dif,
+                signal.value,
+                signal.prof,
             )
-            return opportunity
+            return signal
         return None
 
-    async def scan_many(self, symbols: Iterable[str]) -> List[CexArbitrageOpportunity]:
+    async def scan_many(self, symbols: Iterable[str]) -> List[CexCexSignal]:
         tasks = [self.scan_symbol(symbol) for symbol in symbols]
         results = await asyncio.gather(*tasks)
         return [result for result in results if result]
 
-    def scan_symbol_blocking(self, symbol: str) -> Optional[CexArbitrageOpportunity]:
+    def scan_symbol_blocking(self, symbol: str) -> Optional[CexCexSignal]:
         return asyncio.run(self.scan_symbol(symbol))
 
-    def scan_many_blocking(self, symbols: Iterable[str]) -> List[CexArbitrageOpportunity]:
+    def scan_many_blocking(self, symbols: Iterable[str]) -> List[CexCexSignal]:
         return asyncio.run(self.scan_many(symbols))
