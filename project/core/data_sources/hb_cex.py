@@ -1,109 +1,109 @@
 # project/core/data_sources/hb_cex.py
 
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import Dict, Tuple, List
 
-from hummingbot.client.settings import AllConnectorSettings
-from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
+from hummingbot.core.utils.async_utils import safe_ensure_future
 
 
 class HBCEXDataSource:
     """
-    Minimalistic Hummingbot-based CEX data source for arbitrage scanner.
+    Minimal standalone Hummingbot connector wrapper.
+    Works WITHOUT starting HummingbotApplication.
 
-    Only responsibilities:
-    - Load connector
-    - Pull best bid/ask
-    - Pull orderbook depth
-    - Give ability to compute effective price for volume
+    Supports:
+    - Live orderbook via websocket
+    - Best bid/ask
+    - VWAP depth quote
     """
 
     def __init__(self, exchange: str, trading_pair: str):
         """
-        :param exchange: e.g., 'binance', 'bybit', 'okx'
-        :param trading_pair: e.g., 'BTC-USDT'
+        :param exchange: 'binance', 'okx', 'gate_io', etc.
+        :param trading_pair: 'BTC-USDT'
         """
-        self.exchange = exchange
+        self.exchange_name = exchange
         self.trading_pair = trading_pair
+
+        # Connector instance (we create manually)
         self.connector = None
-        self._app = None
+
+        # Maps exchange => class
+        self.exchange_map = {
+            "binance": BinanceExchange,
+            # далее добавим другие биржи (okx, bybit, gate, bingx)
+        }
+
+        if exchange not in self.exchange_map:
+            raise ValueError(f"Exchange '{exchange}' not implemented yet.")
 
     async def connect(self):
         """
-        Loads and initializes connector through Hummingbot core.
+        Initializes the connector and starts orderbook streams.
         """
-        self._app = HummingbotApplication.main_application()
 
-        # Ensure connector exists in Hummingbot list
-        if self.exchange not in AllConnectorSettings.get_connector_settings().keys():
-            raise ValueError(f"Exchange '{self.exchange}' is not supported by Hummingbot.")
+        connector_class = self.exchange_map[self.exchange_name]
 
-        # Load connector instance
-        await self._app._initialize_connectors([self.exchange])
+        self.connector = connector_class(
+            client_config_map=None,         # not needed for read-only mode
+            connector_name=self.exchange_name,
+            trading_pairs=[self.trading_pair]
+        )
 
-        self.connector = self._app.connectors.get(self.exchange)
-        if self.connector is None:
-            raise RuntimeError(f"Failed to load connector: {self.exchange}")
-
-        # Subscribe to orderbook updates
+        # Initialize websocket pipelines
         await self.connector.start_network()
+        await asyncio.sleep(2)  # wait for websocket to connect
+
+        # Start orderbook tracker
+        safe_ensure_future(self.connector._order_book_tracker.start())
+        await asyncio.sleep(2)
 
     async def get_best_bid_ask(self) -> Dict[str, float]:
         """
-        Returns best bid/ask for the trading pair.
+        Returns {'bid': ..., 'ask': ...}
         """
         ob = self.connector.order_book_tracker.order_books.get(self.trading_pair)
         if ob is None:
-            raise RuntimeError(f"No orderbook for {self.exchange} {self.trading_pair}")
-
-        best_bid = ob.get_price("bid")
-        best_ask = ob.get_price("ask")
+            raise RuntimeError("Orderbook not ready")
 
         return {
-            "bid": best_bid,
-            "ask": best_ask,
+            "bid": ob.get_price("bid"),
+            "ask": ob.get_price("ask"),
         }
 
-    async def get_depth(self, side: str, volume_usd: float) -> float:
+    async def get_vwap_price(self, side: str, quote_volume: float) -> float:
         """
-        Computes volume-weighted average price (VWAP) for given USD value.
-
-        :param side: 'buy' or 'sell'
-        :param volume_usd: desired USD notional
-        :return: average execution price for the whole volume
+        :param side: "buy" or "sell"
+        :param quote_volume: volume in QUOTE currency (e.g. 1000 USDT)
+        :return: VWAP price
         """
         ob = self.connector.order_book_tracker.order_books.get(self.trading_pair)
         if ob is None:
-            raise RuntimeError("Orderbook not available")
+            raise RuntimeError("Orderbook not ready")
 
-        side_book = ob.ask_entries() if side == "buy" else ob.bid_entries()
+        entries = ob.ask_entries() if side == "buy" else ob.bid_entries()
 
-        remaining = volume_usd
-        total_cost = 0.0
+        remaining = quote_volume
+        total_quote_cost = 0.0
+        total_base_amount = 0.0
 
-        for price, amount in side_book:
-            step_value = amount * price
-            if step_value >= remaining:
-                total_cost += remaining
+        for price, amount in entries:
+            step_quote_value = price * amount
+
+            if step_quote_value >= remaining:
+                partial_base = remaining / price
+                total_quote_cost += remaining
+                total_base_amount += partial_base
                 remaining = 0
                 break
-            else:
-                total_cost += step_value
-                remaining -= step_value
+
+            remaining -= step_quote_value
+            total_quote_cost += step_quote_value
+            total_base_amount += amount
 
         if remaining > 0:
-            raise RuntimeError(f"Not enough liquidity on {self.exchange} to fill {volume_usd}$")
+            raise RuntimeError(f"Not enough liquidity to fill {quote_volume}$")
 
-        avg_price = total_cost / (volume_usd / price)
-        return avg_price
-
-    async def get_networks(self) -> Optional[List[str]]:
-        """
-        Returns list of withdrawal networks (if supported by this connector).
-        """
-        try:
-            info = await self.connector.get_account_balances()
-            networks = list(info.get("networks", {}).keys())
-            return networks
-        except Exception:
-            return None
+        # VWAP = total quote spent / total base bought
+        return total_quote_cost / total_base_amount
