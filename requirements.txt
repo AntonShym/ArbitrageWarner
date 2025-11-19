@@ -1,1 +1,3 @@
 hummingbot
+PyYAML
+aiohttp

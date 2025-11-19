@@ -1,0 +1,33 @@
+cex:
+  markets:
+    - exchange: binance
+      trading_pair: BTC-USDT
+      chain: ERC20
+    - exchange: binance
+      trading_pair: ETH-USDT
+      chain: ERC20
+  min_difference: 1.0
+  target_value: 1000.0
+
+cex_dex:
+  enabled: false
+  exchange: binance
+  trading_pair: BTC-USDT
+  dex_buy_token: WBTC
+  dex_sell_token: USDC
+  dex_api: https://api.0x.org
+  min_difference: 2.0
+  target_value: 2000.0
+
+dex_cex:
+  enabled: false
+  exchange: binance
+  trading_pair: BTC-USDT
+  dex_buy_token: USDC
+  dex_sell_token: WBTC
+  dex_api: https://api.0x.org
+  min_difference: 2.0
+  target_value: 2000.0
+
+runtime:
+  timeout_sec: 60

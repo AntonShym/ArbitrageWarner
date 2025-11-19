@@ -1,109 +1,80 @@
-# project/core/data_sources/hb_cex.py
+"""Standalone Hummingbot data source for CEX order books."""
+from __future__ import annotations
 
 import asyncio
-from typing import Dict, Tuple, List
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple, Type
 
 from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
+from hummingbot.connector.exchange_base import ExchangeBase
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
+from project.core.models.orderbook import OrderBookEntry, OrderBookSnapshot, build_entries
 
-class HBCEXDataSource:
-    """
-    Minimal standalone Hummingbot connector wrapper.
-    Works WITHOUT starting HummingbotApplication.
 
-    Supports:
-    - Live orderbook via websocket
-    - Best bid/ask
-    - VWAP depth quote
-    """
+class HummingbotCexDataSource:
+    """Lightweight wrapper around standalone Hummingbot connectors."""
 
-    def __init__(self, exchange: str, trading_pair: str):
-        """
-        :param exchange: 'binance', 'okx', 'gate_io', etc.
-        :param trading_pair: 'BTC-USDT'
-        """
-        self.exchange_name = exchange
-        self.trading_pair = trading_pair
-
-        # Connector instance (we create manually)
-        self.connector = None
-
-        # Maps exchange => class
-        self.exchange_map = {
+    def __init__(self) -> None:
+        self._exchange_map: Mapping[str, Type[ExchangeBase]] = {
             "binance": BinanceExchange,
-            # далее добавим другие биржи (okx, bybit, gate, bingx)
         }
+        self._connectors: Dict[Tuple[str, str], ExchangeBase] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
 
-        if exchange not in self.exchange_map:
-            raise ValueError(f"Exchange '{exchange}' not implemented yet.")
+    async def _ensure_connector(self, exchange: str, trading_pair: str) -> ExchangeBase:
+        key = (exchange, trading_pair)
+        if key in self._connectors:
+            return self._connectors[key]
+        if exchange not in self._exchange_map:
+            raise ValueError(f"Exchange '{exchange}' is not configured.")
 
-    async def connect(self):
-        """
-        Initializes the connector and starts orderbook streams.
-        """
+        lock = self._locks.setdefault(exchange, asyncio.Lock())
+        async with lock:
+            if key in self._connectors:
+                return self._connectors[key]
+            connector_cls = self._exchange_map[exchange]
+            connector = connector_cls(
+                client_config_map=None,
+                connector_name=exchange,
+                trading_pairs=[trading_pair],
+            )
+            await connector.start_network()
+            await asyncio.sleep(1)
+            safe_ensure_future(connector._order_book_tracker.start())
+            await asyncio.sleep(1)
+            self._connectors[key] = connector
+            return connector
 
-        connector_class = self.exchange_map[self.exchange_name]
+    async def fetch_snapshot(self, exchange: str, trading_pair: str) -> OrderBookSnapshot:
+        """Return an order book snapshot for a given exchange/pair."""
+        connector = await self._ensure_connector(exchange, trading_pair)
+        order_book = connector.order_book_tracker.order_books.get(trading_pair)
+        if order_book is None:
+            raise RuntimeError(f"Order book not ready for {exchange}:{trading_pair}")
+        bids = build_entries(order_book.bid_entries())
+        asks = build_entries(order_book.ask_entries())
+        return OrderBookSnapshot(trading_pair, bids, asks)
 
-        self.connector = connector_class(
-            client_config_map=None,         # not needed for read-only mode
-            connector_name=self.exchange_name,
-            trading_pairs=[self.trading_pair]
-        )
+    async def best_prices(self, exchange: str, trading_pair: str) -> Tuple[float, float]:
+        snapshot = await self.fetch_snapshot(exchange, trading_pair)
+        return snapshot.best_bid(), snapshot.best_ask()
 
-        # Initialize websocket pipelines
-        await self.connector.start_network()
-        await asyncio.sleep(2)  # wait for websocket to connect
+    async def vwap(self, exchange: str, trading_pair: str, side: str, quote_value: float) -> float:
+        snapshot = await self.fetch_snapshot(exchange, trading_pair)
+        return snapshot.vwap_price(side, quote_value)
 
-        # Start orderbook tracker
-        safe_ensure_future(self.connector._order_book_tracker.start())
-        await asyncio.sleep(2)
+    async def gather_best_prices(
+        self,
+        exchanges: Iterable[str],
+        trading_pair: str,
+    ) -> Dict[str, Tuple[float, float]]:
+        """Fetch best bid/ask for multiple exchanges concurrently."""
+        tasks = [self.best_prices(exc, trading_pair) for exc in exchanges]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        data: Dict[str, Tuple[float, float]] = {}
+        for exchange, result in zip(exchanges, results):
+            if isinstance(result, Exception):
+                continue
+            data[exchange] = result
+        return data
 
-    async def get_best_bid_ask(self) -> Dict[str, float]:
-        """
-        Returns {'bid': ..., 'ask': ...}
-        """
-        ob = self.connector.order_book_tracker.order_books.get(self.trading_pair)
-        if ob is None:
-            raise RuntimeError("Orderbook not ready")
-
-        return {
-            "bid": ob.get_price("bid"),
-            "ask": ob.get_price("ask"),
-        }
-
-    async def get_vwap_price(self, side: str, quote_volume: float) -> float:
-        """
-        :param side: "buy" or "sell"
-        :param quote_volume: volume in QUOTE currency (e.g. 1000 USDT)
-        :return: VWAP price
-        """
-        ob = self.connector.order_book_tracker.order_books.get(self.trading_pair)
-        if ob is None:
-            raise RuntimeError("Orderbook not ready")
-
-        entries = ob.ask_entries() if side == "buy" else ob.bid_entries()
-
-        remaining = quote_volume
-        total_quote_cost = 0.0
-        total_base_amount = 0.0
-
-        for price, amount in entries:
-            step_quote_value = price * amount
-
-            if step_quote_value >= remaining:
-                partial_base = remaining / price
-                total_quote_cost += remaining
-                total_base_amount += partial_base
-                remaining = 0
-                break
-
-            remaining -= step_quote_value
-            total_quote_cost += step_quote_value
-            total_base_amount += amount
-
-        if remaining > 0:
-            raise RuntimeError(f"Not enough liquidity to fill {quote_volume}$")
-
-        # VWAP = total quote spent / total base bought
-        return total_quote_cost / total_base_amount
