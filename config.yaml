@@ -1,0 +1,17 @@
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+exchanges:
+  - binance
+  - kucoin
+  - gateio
+  - mexc
+  - bybit
+min_profit_percent: 0.5
+notional: 1000
+classification:
+  high: 1.5
+  medium: 0.8
+timeouts:
+  cex_cex_seconds: 120

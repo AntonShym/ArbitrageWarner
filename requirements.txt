@@ -1,2 +1,2 @@
-ccxt
-python-telegram-bot
+PyYAML
+git+https://github.com/hummingbot/quants-lab.git
